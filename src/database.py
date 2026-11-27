@@ -1,107 +1,176 @@
 """
 Life Calendar - Database module
 SQLite storage for settings, categories, and events.
+
+Connection strategy:
+  - Short-lived connections via get_connection() / context manager.
+  - foreign_keys=ON and WAL on every connection.
+  - Schema version stored in settings['schema_version'].
 """
+
+from __future__ import annotations
 
 import sqlite3
 import json
+import logging
+from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Iterator, Generator
 import uuid
-import shutil
+
+logger = logging.getLogger("life_calendar.db")
 
 DB_PATH = Path(__file__).parent.parent / "data" / "life_calendar.db"
+SCHEMA_VERSION = 2  # 1 = original 1.0/1.1 schema; 2 = explicit version marker
 
 
 def get_connection() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=10.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
     return conn
 
 
+@contextmanager
+def db_connection() -> Generator[sqlite3.Connection, None, None]:
+    """Context manager that always closes the connection."""
+    conn = get_connection()
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def _get_schema_version(conn: sqlite3.Connection) -> int:
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='settings'")
+    if not cur.fetchone():
+        return 0
+    cur.execute("SELECT value FROM settings WHERE key = 'schema_version'")
+    row = cur.fetchone()
+    if row:
+        try:
+            return int(row["value"] if isinstance(row, sqlite3.Row) else row[0])
+        except (TypeError, ValueError):
+            return 1
+    # Table exists but no version → legacy 1.0/1.1
+    return 1
+
+
+def _migrate(conn: sqlite3.Connection, from_version: int) -> None:
+    """Apply sequential migrations. Currently schema is compatible; only mark version."""
+    cur = conn.cursor()
+    if from_version < 2:
+        # No structural change from 1.1 → 1.2; just record version.
+        # Ensure index exists (idempotent).
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_week ON events(week_year, week_number)"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_category ON events(category_id)"
+        )
+        cur.execute(
+            "INSERT INTO settings (key, value) VALUES ('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (str(SCHEMA_VERSION),)
+        )
+        logger.info("Migrated schema from %s to %s", from_version, SCHEMA_VERSION)
+
+
 def init_db() -> None:
     conn = get_connection()
-    cur = conn.cursor()
+    try:
+        cur = conn.cursor()
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        )
-    """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS categories (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL UNIQUE,
-            color TEXT NOT NULL,
-            is_system INTEGER DEFAULT 0,
-            created_at TEXT NOT NULL
-        )
-    """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS categories (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                color TEXT NOT NULL,
+                is_system INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+        """)
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS events (
-            id TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            note TEXT,
-            category_id TEXT,
-            color TEXT,
-            week_year INTEGER NOT NULL,
-            week_number INTEGER NOT NULL,
-            start_date TEXT,
-            end_date TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE SET NULL
-        )
-    """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS events (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                note TEXT,
+                category_id TEXT,
+                color TEXT,
+                week_year INTEGER NOT NULL,
+                week_number INTEGER NOT NULL,
+                start_date TEXT,
+                end_date TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE SET NULL
+            )
+        """)
 
-    cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_events_week 
-        ON events(week_year, week_number)
-    """)
-
-    # Default categories
-    defaults = [
-        ("education", "Образование", "#3B82F6"),
-        ("career", "Работа и карьера", "#8B5CF6"),
-        ("travel", "Путешествия", "#06B6D4"),
-        ("family", "Семья и друзья", "#F59E0B"),
-        ("achievements", "Личные достижения", "#10B981"),
-        ("projects", "Проекты", "#EF4444"),
-        ("rest", "Отдых", "#84CC16"),
-        ("other", "Другое", "#6B7280"),
-    ]
-
-    now = datetime.utcnow().isoformat()
-    for cid, name, color in defaults:
         cur.execute(
-            "INSERT OR IGNORE INTO categories (id, name, color, is_system, created_at) VALUES (?, ?, ?, 1, ?)",
-            (cid, name, color, now)
+            "CREATE INDEX IF NOT EXISTS idx_events_week ON events(week_year, week_number)"
         )
-
-    # Default settings
-    # first_day_of_week: 0 = Monday, 6 = Sunday (Python weekday style)
-    defaults_settings = {
-        "birth_date": "",
-        "life_expectancy": "90",
-        "first_day_of_week": "0",  # Monday by default
-        "theme": "dark",
-        "setup_completed": "0",
-    }
-    for k, v in defaults_settings.items():
         cur.execute(
-            "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
-            (k, v)
+            "CREATE INDEX IF NOT EXISTS idx_events_category ON events(category_id)"
         )
 
-    conn.commit()
-    conn.close()
+        # Default categories
+        defaults = [
+            ("education", "Образование", "#3B82F6"),
+            ("career", "Работа и карьера", "#8B5CF6"),
+            ("travel", "Путешествия", "#06B6D4"),
+            ("family", "Семья и друзья", "#F59E0B"),
+            ("achievements", "Личные достижения", "#10B981"),
+            ("projects", "Проекты", "#EF4444"),
+            ("rest", "Отдых", "#84CC16"),
+            ("other", "Другое", "#6B7280"),
+        ]
+
+        now = datetime.utcnow().isoformat()
+        for cid, name, color in defaults:
+            cur.execute(
+                "INSERT OR IGNORE INTO categories (id, name, color, is_system, created_at) "
+                "VALUES (?, ?, ?, 1, ?)",
+                (cid, name, color, now)
+            )
+
+        # Default settings
+        # first_day_of_week: 0 = Monday, 6 = Sunday (Python weekday).
+        # Note: life-grid weeks are counted from birthday; this setting is for
+        # auxiliary calendar helpers only and does not change the 52-week life grid.
+        defaults_settings = {
+            "birth_date": "",
+            "life_expectancy": "90",
+            "first_day_of_week": "0",
+            "theme": "dark",
+            "setup_completed": "0",
+            "schema_version": str(SCHEMA_VERSION),
+        }
+        for k, v in defaults_settings.items():
+            cur.execute(
+                "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+                (k, v)
+            )
+
+        version = _get_schema_version(conn)
+        if version < SCHEMA_VERSION:
+            _migrate(conn, version)
+
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def get_setting(key: str, default: str = "") -> str:
@@ -308,24 +377,71 @@ def _validate_import_data(data: Any) -> None:
 
 
 def backup_database() -> Optional[Path]:
-    """Create a timestamped backup of the current DB. Returns path or None."""
+    """
+    Create a consistent timestamped backup using SQLite Online Backup API.
+    Safer than shutil.copy2 on a live WAL database.
+    Returns path of backup file, or None if source DB does not exist.
+    """
     if not DB_PATH.exists():
         return None
     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     backup_path = DB_PATH.parent / f"life_calendar_backup_{ts}.db"
-    import shutil
-    shutil.copy2(DB_PATH, backup_path)
-    return backup_path
+    try:
+        src = get_connection()
+        try:
+            dst = sqlite3.connect(str(backup_path))
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+        finally:
+            src.close()
+        logger.info("Database backup created: %s", backup_path)
+        return backup_path
+    except Exception as e:
+        logger.error("Backup failed: %s", e)
+        # Fallback to file copy if online backup fails
+        try:
+            import shutil
+            shutil.copy2(DB_PATH, backup_path)
+            logger.warning("Fell back to shutil.copy2 for backup")
+            return backup_path
+        except Exception as e2:
+            logger.error("Fallback backup also failed: %s", e2)
+            return None
 
 
-def import_data(json_str: str) -> str:
+def restore_from_backup(backup_path: Path) -> None:
+    """Replace current DB with a backup file (uses Online Backup API)."""
+    backup_path = Path(backup_path)
+    if not backup_path.exists():
+        raise FileNotFoundError(f"Backup not found: {backup_path}")
+    # Ensure directory exists
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    src = sqlite3.connect(str(backup_path))
+    try:
+        dst = get_connection()
+        try:
+            src.backup(dst)
+            dst.commit()
+        finally:
+            dst.close()
+    finally:
+        src.close()
+    logger.info("Restored database from %s", backup_path)
+
+
+def import_data(json_str: str, max_bytes: int = 10 * 1024 * 1024) -> str:
     """
     Safely import data from JSON string.
-    - Validates structure
+    - Validates structure and size
     - Creates automatic backup before changes
     - Uses a transaction; rolls back on any error
     Returns path of the backup file (or empty string).
     """
+    if len(json_str.encode("utf-8")) > max_bytes:
+        raise ValueError(f"Файл слишком большой (лимит {max_bytes // (1024*1024)} МБ)")
+
     try:
         data = json.loads(json_str)
     except json.JSONDecodeError as e:

@@ -62,8 +62,19 @@ class LifeCalendarApp(ctk.CTk):
         self._grid_meta = {}
         self._highlight_week: Optional[Tuple[int, int]] = None  # (life_year, week)
 
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build_ui()
         self.after(100, self._check_setup)
+
+    def _on_close(self):
+        """Clean up reusable tooltip window and exit."""
+        if self.tooltip is not None:
+            try:
+                self.tooltip.destroy()
+            except Exception:
+                pass
+            self.tooltip = None
+        self.destroy()
 
     def _check_setup(self):
         if self.settings.get("setup_completed") != "1" or not self.birth_date:
@@ -341,6 +352,29 @@ class LifeCalendarApp(ctk.CTk):
         else:
             self._hide_tooltip()
 
+    def _ensure_tooltip(self):
+        """Single reusable tooltip window — avoids create/destroy on every mouse move."""
+        if self.tooltip is not None:
+            try:
+                if self.tooltip.winfo_exists():
+                    return
+            except tk.TclError:
+                self.tooltip = None
+        self.tooltip = tk.Toplevel(self)
+        self.tooltip.wm_overrideredirect(True)
+        try:
+            self.tooltip.wm_attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        self._tooltip_label = tk.Label(
+            self.tooltip, text="", justify="left",
+            background="#1E293B", foreground="#E2E8F0",
+            relief="solid", borderwidth=1,
+            font=("Segoe UI", 10), padx=8, pady=6
+        )
+        self._tooltip_label.pack()
+        self.tooltip.withdraw()
+
     def _show_tooltip(self, event, row: int, col: int):
         if not self.birth_date:
             return
@@ -364,21 +398,19 @@ class LifeCalendarApp(ctk.CTk):
             f"{start.strftime('%d.%m.%Y')} – {end.strftime('%d.%m.%Y')}\n"
             f"Статус: {status}{ev_text}"
         )
-        self._hide_tooltip()
-        self.tooltip = tk.Toplevel(self)
-        self.tooltip.wm_overrideredirect(True)
+        self._ensure_tooltip()
+        self._tooltip_label.configure(text=text)
         self.tooltip.wm_geometry(f"+{event.x_root + 12}+{event.y_root + 12}")
-        tk.Label(
-            self.tooltip, text=text, justify="left",
-            background="#1E293B", foreground="#E2E8F0",
-            relief="solid", borderwidth=1,
-            font=("Segoe UI", 10), padx=8, pady=6
-        ).pack()
+        self.tooltip.deiconify()
+        self.tooltip.lift()
 
     def _hide_tooltip(self, event=None):
-        if self.tooltip:
-            self.tooltip.destroy()
-            self.tooltip = None
+        if self.tooltip is not None:
+            try:
+                if self.tooltip.winfo_exists():
+                    self.tooltip.withdraw()
+            except tk.TclError:
+                self.tooltip = None
 
     def _on_canvas_click(self, event):
         hit = self._hit_test(event)

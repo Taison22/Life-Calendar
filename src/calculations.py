@@ -1,6 +1,12 @@
 """
 Life Calendar - Date and age calculations.
 Accurate calendar math with leap years.
+
+Concepts:
+  - Life-grid weeks are counted from the user's birthday anniversary
+    (life_year 0 starts at birth; each row = one year of life, 52 weeks).
+  - first_day_of_week (0=Monday … 6=Sunday) affects only auxiliary helpers
+    such as get_week_start / get_week_dates. It does NOT change the life grid.
 """
 
 from datetime import date, datetime, timedelta
